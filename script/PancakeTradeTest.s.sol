@@ -25,11 +25,14 @@ contract PancakeTradeTest is Script {
     function test_trade() public {
         sender = vm.addr(vm.envUint("OP_PRI"));
         vm.startBroadcast(vm.envUint("OP_PRI"));
-        PancakeTrade trade = new PancakeTrade(routerv2, routerv3);
-        address impl = trade.executorBotImpl();
-        address owner = ExecutorBot(impl).owner();
-        console.log(owner);
-        trade.setFee(1e4, 1000, sender);
 
+
+        PancakeTrade trade = new PancakeTrade(routerv2, routerv3);
+        trade.setFee(5e10, 1000, sender);
+        
+        // trade.setManager(sender);
+        // trade.setMaker(sender, sender);
+        // trade.setFee(1e4, 1000, sender);
+        // ERC20Mock usdt =ERC20Mock();
     }
 }

@@ -65,6 +65,21 @@ interface IPancakeV3Factory {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
 }
 
+interface IPancakeV3Pool {
+    function slot0()
+        external
+        view
+        returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint32 feeProtocol,
+            bool unlocked
+        );
+}
+
 contract ExecutorBot {
     address public immutable owner;
 
@@ -88,19 +103,29 @@ contract PancakeTrade is Ownable, Multicall {
     address public immutable routerv3;
     address public immutable executorBotImpl;
 
+    //treasury=>manager
+    mapping(address => address) public manager;
+    //treasury=>marker
     mapping(address => address) public marker;
     mapping(address => uint256) public markerNonce;
     mapping(address => uint256) public treasuryFee;
-    mapping(address => mapping(address => bool)) public pairWL;
 
-    //manager
+    //treasury=>pair=>boolean
+    mapping(address => mapping(address => bool)) public pairWL;
+    //treasury=>pair=>maxPrice
+    mapping(address => mapping(address => uint256)) public priceLimitMax;
+    //treasury=>pair=>minPrice
+    mapping(address => mapping(address => uint256)) public priceLimitMin;
+
+    //fee info
+    uint256 public baseFee = 50000;
     uint256 public monthFee;
     uint256 public feeRate; // 10000
     address public feeReceiver;
     mapping(address => mapping(uint256 => uint256)) public curMonthFee;
 
-    modifier onlyMaker(address _treasury, address _maker) {
-        require(marker[_treasury] == _maker, "maker err");
+    modifier onlyTreasuryOrManager(address _treasury) {
+        require(msg.sender == manager[_treasury] || msg.sender == _treasury, "t m err");
         _;
     }
 
@@ -123,7 +148,8 @@ contract PancakeTrade is Ownable, Multicall {
         bytes memory signature
     )
         public
-        ensure(
+        handleFee(_treasury)
+        checkMakerDeadline(
             deadline,
             signature,
             _treasury,
@@ -136,6 +162,7 @@ contract PancakeTrade is Ownable, Multicall {
         IERC20(path[0]).safeTransferFrom(_treasury, pair, amountIn);
         address _bot = getBotAddr(_treasury, botId);
         _internalSwap(isFee, amountIn, path, _bot, pair, amountOutMin);
+        checkPriceLimit(true, _treasury, pair);
     }
 
     //v2
@@ -150,7 +177,8 @@ contract PancakeTrade is Ownable, Multicall {
         bytes memory signature
     )
         public
-        ensure(
+        handleFee(_treasury)
+        checkMakerDeadline(
             deadline,
             signature,
             _treasury,
@@ -168,6 +196,7 @@ contract PancakeTrade is Ownable, Multicall {
             _amountIn += amountIns[i];
         }
         _internalSwap(isFee, _amountIn, path, _treasury, pair, amountOutMin);
+        checkPriceLimit(true, _treasury, pair);
     }
 
     function _internalSwap(
@@ -235,7 +264,8 @@ contract PancakeTrade is Ownable, Multicall {
         ISwapRouter.ExactInputSingleParams calldata params
     )
         public
-        ensure(
+        handleFee(_treasury)
+        checkMakerDeadline(
             params.deadline,
             signature,
             _treasury,
@@ -262,6 +292,7 @@ contract PancakeTrade is Ownable, Multicall {
         address _bot = createOrGetBot(_treasury, botId);
         IERC20(params.tokenIn).safeTransferFrom(_treasury, _bot, params.amountIn);
         _internalSwapV3(_bot, params);
+        checkPriceLimit(false, _treasury, pool);
     }
 
     function swapExactTokensForTokensFromBotsV3(
@@ -272,7 +303,8 @@ contract PancakeTrade is Ownable, Multicall {
         ISwapRouter.ExactInputSingleParams calldata params
     )
         public
-        ensure(
+        handleFee(_treasury)
+        checkMakerDeadline(
             params.deadline,
             signature,
             _treasury,
@@ -307,6 +339,7 @@ contract PancakeTrade is Ownable, Multicall {
         require(amountIn == params.amountIn, "ai err");
         require(_treasury == params.recipient, "rec err");
         _internalSwapV3(senderBot, params);
+        checkPriceLimit(false, _treasury, pool);
     }
 
     function _internalSwapV3(address senderBot, ISwapRouter.ExactInputSingleParams calldata params) private {
@@ -319,8 +352,13 @@ contract PancakeTrade is Ownable, Multicall {
         return IPancakeV3Factory(factory3).getPool(tokenA, tokenB, fee);
     }
 
-    modifier ensure(uint256 deadline, bytes memory signature, address _treasury, address sender, bytes32 hash) {
-        uint256 gas1 = gasleft();
+    modifier checkMakerDeadline(
+        uint256 deadline,
+        bytes memory signature,
+        address _treasury,
+        address sender,
+        bytes32 hash
+    ) {
         require(!isContract(sender), "con err");
         address _marker = marker[_treasury];
         require(deadline >= block.timestamp, "Router: EXPIRED");
@@ -328,9 +366,14 @@ contract PancakeTrade is Ownable, Multicall {
         require(verify(hash, signature, _marker), "sig err");
         markerNonce[_marker] = deadline;
         _;
+    }
+
+    modifier handleFee(address _treasury) {
+        uint256 gas1 = gasleft();
+        _;
         //handle sender fee and dao fee
         uint256 gas2 = gasleft();
-        uint256 feeToSender = (gas1 - gas2 + 40000) * tx.gasprice;
+        uint256 feeToSender = (gas1 - gas2 + baseFee) * tx.gasprice;
         uint256 total = feeToSender;
         uint256 curMonth = block.timestamp / 30 days;
         if (curMonthFee[_treasury][curMonth] < monthFee && feeRate > 0) {
@@ -342,6 +385,28 @@ contract PancakeTrade is Ownable, Multicall {
         }
         treasuryFee[_treasury] -= total;
         payable(msg.sender).transfer(feeToSender);
+    }
+
+    function checkPriceLimit(bool isV2, address _treasury, address pair) public view {
+        uint256 curPrice;
+        uint256 min = priceLimitMin[_treasury][pair];
+        uint256 max = priceLimitMax[_treasury][pair];
+        if (min == 0 && max == 0) {
+            return;
+        }
+        if (isV2) {
+            (uint112 reserve0, uint112 reserve1,) = IPancakePair(pair).getReserves();
+            curPrice = 1e18 * uint256(reserve0) / uint256(reserve1);
+        } else {
+            (uint160 sqrtPriceX96,,,,,,) = IPancakeV3Pool(pair).slot0();
+            curPrice = uint256(sqrtPriceX96);
+        }
+        if (min > 0) {
+            require(curPrice >= min, "price min limit");
+        }
+        if (max > 0) {
+            require(curPrice <= max, "price max limit");
+        }
     }
 
     function getBotInfo(
@@ -390,10 +455,10 @@ contract PancakeTrade is Ownable, Multicall {
         treasuryFee[msg.sender] += msg.value;
     }
 
-    // batch transfer eth
+    // collect token
     function collect(address _treasury, uint16[] memory botIds, address _token)
         external
-        onlyMaker(_treasury, msg.sender)
+        onlyTreasuryOrManager(_treasury)
     {
         for (uint256 i = 0; i < botIds.length; i++) {
             address _bot = createOrGetBot(_treasury, botIds[i]);
@@ -439,38 +504,37 @@ contract PancakeTrade is Ownable, Multicall {
         return size > 0;
     }
 
-    //set maker
-    function setMaker(address maker) external {
-        marker[msg.sender] = maker;
+    //set manager by treasury
+    function setManager(address _manager) external {
+        manager[msg.sender] = _manager;
     }
 
-    //set pair
+    //set pair by treasury
     function setPair(address pair, bool wl) external {
         pairWL[msg.sender][pair] = wl;
     }
 
+    //set maker by manager or treasury
+    function setMaker(address _treasury, address maker) external onlyTreasuryOrManager(_treasury) {
+        require(msg.sender == manager[_treasury] || msg.sender == _treasury, "set m err");
+        marker[_treasury] = maker;
+    }
+
+    //set price limit by manager or treasury
+    function setPriceLimit(address _treasury, address _pair, uint256 _minPrice, uint256 _maxPrice)
+        external
+        onlyTreasuryOrManager(_treasury)
+    {
+        priceLimitMin[_treasury][_pair] = _minPrice;
+        priceLimitMax[_treasury][_pair] = _maxPrice;
+    }
+
     //withdraw fee
-    function withdrawFee(address _treasury) external {
-        require(msg.sender == _treasury || msg.sender == marker[_treasury], "a err");
+    function withdrawFee(address _treasury) external onlyTreasuryOrManager(_treasury) {
         uint256 val = treasuryFee[_treasury];
         require(val > 0, "valf err");
         treasuryFee[_treasury] = 0;
         payable(msg.sender).transfer(val);
-    }
-
-    // batch transfer eth
-    function batchTransferEth(address[] memory addrs, uint256 amount) external payable {
-        require(msg.value >= amount * addrs.length, "bte");
-        for (uint256 i = 0; i < addrs.length; i++) {
-            payable(addrs[i]).transfer(amount);
-        }
-    }
-
-    // batch transfer token
-    function batchTransferToken(address[] memory addrs, uint256 amount, address token) external {
-        for (uint256 i = 0; i < addrs.length; i++) {
-            IERC20(token).safeTransferFrom(msg.sender, addrs[i], amount);
-        }
     }
 
     function verify(bytes32 hash, bytes memory signature, address expectedSigner) public pure returns (bool) {
@@ -503,5 +567,26 @@ contract PancakeTrade is Ownable, Multicall {
         monthFee = _monthFee;
         feeRate = _feeRate;
         feeReceiver = _feeReceiver;
+    }
+
+    //manager
+    function setBaseFee(uint256 _baseFee) external onlyOwner {
+        baseFee = _baseFee;
+    }
+
+    // transfer utils
+    // batch transfer eth
+    function batchTransferEth(address[] memory addrs, uint256 amount) external payable {
+        require(msg.value >= amount * addrs.length, "bte");
+        for (uint256 i = 0; i < addrs.length; i++) {
+            payable(addrs[i]).transfer(amount);
+        }
+    }
+
+    // batch transfer token
+    function batchTransferToken(address[] memory addrs, uint256 amount, address token) external {
+        for (uint256 i = 0; i < addrs.length; i++) {
+            IERC20(token).safeTransferFrom(msg.sender, addrs[i], amount);
+        }
     }
 }

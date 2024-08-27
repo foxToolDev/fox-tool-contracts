@@ -26,9 +26,9 @@ contract PancakeTradePro is Script {
         sender = vm.addr(vm.envUint("OP_PRI_PRO"));
         vm.startBroadcast(vm.envUint("OP_PRI_PRO"));
         PancakeTrade trade = new PancakeTrade(factory, router);
-       
+        trade.setFee(5e10, 1000, sender);
 
-        trade.setMaker(sender);
-
+        // trade.setManager(sender);
+        // trade.setMaker(sender, sender);
     }
 }
