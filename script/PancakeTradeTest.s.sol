@@ -26,12 +26,12 @@ contract PancakeTradeTest is Script {
         sender = vm.addr(vm.envUint("OP_PRI"));
         vm.startBroadcast(vm.envUint("OP_PRI"));
 
-
         PancakeTrade trade = new PancakeTrade(routerv2, routerv3);
         trade.setFee(5e10, 1000, sender);
-        
-        // trade.setManager(sender);
-        // trade.setMaker(sender, sender);
+
+        trade.setManager(sender);
+        trade.setMaker(sender, sender);
+        trade.setGasPriceLimit(sender, 10e9);
         // trade.setFee(1e4, 1000, sender);
         // ERC20Mock usdt =ERC20Mock();
     }

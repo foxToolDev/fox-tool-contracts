@@ -8,8 +8,9 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
-
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IPancakeFactory {
     function getPair(address tokenA, address tokenB) external view returns (address pair);
@@ -87,15 +88,16 @@ contract ExecutorBot {
         owner = _owner;
     }
 
-    function execute(address target, bytes calldata data, uint256 value) public returns (bytes memory) {
+    function execute(address target, bytes calldata data, uint256 value) public payable returns (bytes memory) {
         require(msg.sender == owner, "not owner");
-        (bool success, bytes memory returndata) = target.call{value: value}(data);
-        return Address.verifyCallResult(success, returndata);
+        return Address.functionCallWithValue(target, data, value);
     }
 }
 
-contract PancakeTrade is Ownable, Multicall {
+contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
     using SafeERC20 for IERC20;
+
+    bytes32 public constant _TYPEHASH = keccak256("ParamsHash(uint8 actionType,bytes32 hash)");
 
     address public immutable factory;
     address public immutable router;
@@ -116,6 +118,8 @@ contract PancakeTrade is Ownable, Multicall {
     mapping(address => mapping(address => uint256)) public priceLimitMax;
     //treasury=>pair=>minPrice
     mapping(address => mapping(address => uint256)) public priceLimitMin;
+    //treasury=>gasPrice
+    mapping(address => uint256) public gasPriceLimit;
 
     //fee info
     uint256 public baseFee = 50000;
@@ -129,7 +133,7 @@ contract PancakeTrade is Ownable, Multicall {
         _;
     }
 
-    constructor(address _router, address _routerv3) Ownable(msg.sender) {
+    constructor(address _router, address _routerv3) Ownable(msg.sender) EIP712("foxtool", "1") {
         router = _router;
         routerv3 = _routerv3;
         factory = IPancakeRouter01(_router).factory();
@@ -154,8 +158,10 @@ contract PancakeTrade is Ownable, Multicall {
             signature,
             _treasury,
             msg.sender,
-            keccak256(abi.encodePacked(uint8(0), deadline, path, botId, amountIn, amountOutMin, isFee, msg.sender))
+            uint8(0),
+            keccak256(abi.encodePacked(deadline, path, botId, amountIn, amountOutMin, isFee, msg.sender))
         )
+        nonReentrant
     {
         address pair = IPancakeFactory(factory).getPair(path[0], path[1]);
         require(pairWL[_treasury][pair], "pair wl err");
@@ -183,8 +189,10 @@ contract PancakeTrade is Ownable, Multicall {
             signature,
             _treasury,
             msg.sender,
-            keccak256(abi.encodePacked(uint8(1), deadline, path, botIds, amountIns, amountOutMin, isFee, msg.sender))
+            uint8(1),
+            keccak256(abi.encodePacked(deadline, path, botIds, amountIns, amountOutMin, isFee, msg.sender))
         )
+        nonReentrant
     {
         address pair = IPancakeFactory(factory).getPair(path[0], path[1]);
         require(pairWL[_treasury][pair], "pair wl err");
@@ -270,9 +278,9 @@ contract PancakeTrade is Ownable, Multicall {
             signature,
             _treasury,
             msg.sender,
+            uint8(2),
             keccak256(
                 abi.encodePacked(
-                    uint8(2),
                     botId,
                     params.tokenIn,
                     params.tokenOut,
@@ -286,6 +294,7 @@ contract PancakeTrade is Ownable, Multicall {
                 )
             )
         )
+        nonReentrant
     {
         address pool = getPancakeV3Pool(params.tokenIn, params.tokenOut, params.fee);
         require(pairWL[_treasury][pool], "pool wl err");
@@ -309,9 +318,9 @@ contract PancakeTrade is Ownable, Multicall {
             signature,
             _treasury,
             msg.sender,
+            uint8(3),
             keccak256(
                 abi.encodePacked(
-                    uint8(3),
                     botIds,
                     amountIns,
                     params.tokenIn,
@@ -326,6 +335,7 @@ contract PancakeTrade is Ownable, Multicall {
                 )
             )
         )
+        nonReentrant
     {
         address pool = getPancakeV3Pool(params.tokenIn, params.tokenOut, params.fee);
         require(pairWL[_treasury][pool], "pool wl err");
@@ -357,19 +367,23 @@ contract PancakeTrade is Ownable, Multicall {
         bytes memory signature,
         address _treasury,
         address sender,
-        bytes32 hash
+        uint8 actionType,
+        bytes32 paramsHash
     ) {
         require(!isContract(sender), "con err");
         address _marker = marker[_treasury];
         require(deadline >= block.timestamp, "Router: EXPIRED");
         require(deadline > markerNonce[_marker], "nonce used");
-        require(verify(hash, signature, _marker), "sig err");
+        bytes memory abiEncode = abi.encode(_TYPEHASH, actionType, paramsHash);
+        bytes32 digest = _hashTypedDataV4(keccak256(abiEncode));
+        require(ECDSA.recover(digest, signature) == _marker, "sig err");
         markerNonce[_marker] = deadline;
         _;
     }
 
     modifier handleFee(address _treasury) {
         uint256 gas1 = gasleft();
+        require(tx.gasprice <= gasPriceLimit[_treasury], "gasprice err");
         _;
         //handle sender fee and dao fee
         uint256 gas2 = gasleft();
@@ -381,10 +395,10 @@ contract PancakeTrade is Ownable, Multicall {
             uint256 feeToDao = feeRate * feeToSender / 10000;
             curMonthFee[_treasury][curMonth] += feeToDao;
             total = feeToSender + feeToDao;
-            payable(feeReceiver).transfer(feeToDao);
+            Address.sendValue(payable(feeReceiver), feeToDao);
         }
         treasuryFee[_treasury] -= total;
-        payable(msg.sender).transfer(feeToSender);
+        Address.sendValue(payable(msg.sender), feeToSender);
     }
 
     function checkPriceLimit(bool isV2, address _treasury, address pair) public view {
@@ -409,14 +423,15 @@ contract PancakeTrade is Ownable, Multicall {
         }
     }
 
-    function getBotInfo(
-        address _treasury,
-        uint16 startIndex,
-        uint16 endIndex,
-        address token,
-        uint256 amountOut,
-        address[] memory path
-    ) external view returns (uint256[] memory bals, uint256[] memory amounts) {
+    function checkZeroAddr(address addr) public view {
+        require(addr != address(0), "zero addr");
+    }
+
+    function getBotInfo(address _treasury, uint16 startIndex, uint16 endIndex, address token)
+        external
+        view
+        returns (uint256[] memory bals)
+    {
         uint256 size = endIndex - startIndex;
         bals = new uint256[](size);
         for (uint16 i = startIndex; i < endIndex; i++) {
@@ -424,9 +439,6 @@ contract PancakeTrade is Ownable, Multicall {
             if (token != address(0)) {
                 bals[i - startIndex] = IERC20(token).balanceOf(bot);
             }
-        }
-        if (amountOut > 0 && path.length > 1) {
-            amounts = IPancakeRouter01(router).getAmountsIn(amountOut, path);
         }
     }
 
@@ -440,7 +452,10 @@ contract PancakeTrade is Ownable, Multicall {
 
     function botTransfer(address _bot, address _token, address to, uint256 amount) private {
         bytes memory transferData = abi.encodeWithSelector(IERC20.transfer.selector, to, amount);
-        ExecutorBot(_bot).execute(_token, transferData, 0);
+        bytes memory returndata = ExecutorBot(_bot).execute(_token, transferData, 0);
+        if (returndata.length != 0 && !abi.decode(returndata, (bool))) {
+            revert SafeERC20.SafeERC20FailedOperation(_token);
+        }
     }
 
     function getAmountsOut(uint256 amountIn, address[] memory path) public view returns (uint256[] memory amounts) {
@@ -506,17 +521,18 @@ contract PancakeTrade is Ownable, Multicall {
 
     //set manager by treasury
     function setManager(address _manager) external {
+        checkZeroAddr(_manager);
         manager[msg.sender] = _manager;
     }
 
     //set pair by treasury
     function setPair(address pair, bool wl) external {
+        checkZeroAddr(pair);
         pairWL[msg.sender][pair] = wl;
     }
 
     //set maker by manager or treasury
     function setMaker(address _treasury, address maker) external onlyTreasuryOrManager(_treasury) {
-        require(msg.sender == manager[_treasury] || msg.sender == _treasury, "set m err");
         marker[_treasury] = maker;
     }
 
@@ -529,6 +545,11 @@ contract PancakeTrade is Ownable, Multicall {
         priceLimitMax[_treasury][_pair] = _maxPrice;
     }
 
+    //set gas price limit by manager or treasury
+    function setGasPriceLimit(address _treasury, uint256 _gasPrice) external onlyTreasuryOrManager(_treasury) {
+        gasPriceLimit[_treasury] = _gasPrice;
+    }
+
     //withdraw fee
     function withdrawFee(address _treasury) external onlyTreasuryOrManager(_treasury) {
         uint256 val = treasuryFee[_treasury];
@@ -537,22 +558,19 @@ contract PancakeTrade is Ownable, Multicall {
         payable(msg.sender).transfer(val);
     }
 
-    function verify(bytes32 hash, bytes memory signature, address expectedSigner) public pure returns (bool) {
-        bytes32 _hash = MessageHashUtils.toEthSignedMessageHash(hash);
-        address recoveredSigner = ECDSA.recover(_hash, signature);
-        return recoveredSigner == expectedSigner;
-    }
-
     function depositFee(address _treasury) public payable {
         require(msg.value > 0, "val err");
+        checkZeroAddr(_treasury);
         treasuryFee[_treasury] += msg.value;
     }
 
     function depositDaoFee(address _treasury) public payable {
+        checkZeroAddr(_treasury);
+        checkZeroAddr(feeReceiver);
         require(msg.value > 0, "val err");
         uint256 curMonth = block.timestamp / 30 days;
         curMonthFee[_treasury][curMonth] += msg.value;
-        payable(feeReceiver).transfer(msg.value);
+        Address.sendValue(payable(feeReceiver), msg.value);
     }
 
     function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
@@ -563,7 +581,8 @@ contract PancakeTrade is Ownable, Multicall {
 
     //manager
     function setFee(uint256 _monthFee, uint256 _feeRate, address _feeReceiver) external onlyOwner {
-        require(feeRate < 10000, "fr err");
+        require(_feeRate < 10000, "fr err");
+        checkZeroAddr(_feeReceiver);
         monthFee = _monthFee;
         feeRate = _feeRate;
         feeReceiver = _feeReceiver;
@@ -577,15 +596,17 @@ contract PancakeTrade is Ownable, Multicall {
     // transfer utils
     // batch transfer eth
     function batchTransferEth(address[] memory addrs, uint256 amount) external payable {
-        require(msg.value >= amount * addrs.length, "bte");
+        require(msg.value == amount * addrs.length, "bte");
         for (uint256 i = 0; i < addrs.length; i++) {
-            payable(addrs[i]).transfer(amount);
+            checkZeroAddr(addrs[i]);
+            Address.sendValue(payable(addrs[i]), amount);
         }
     }
 
     // batch transfer token
     function batchTransferToken(address[] memory addrs, uint256 amount, address token) external {
         for (uint256 i = 0; i < addrs.length; i++) {
+            checkZeroAddr(addrs[i]);
             IERC20(token).safeTransferFrom(msg.sender, addrs[i], amount);
         }
     }
