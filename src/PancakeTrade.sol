@@ -424,7 +424,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         }
     }
 
-    function checkZeroAddr(address addr) public view {
+    function checkZeroAddr(address addr) public pure {
         require(addr != address(0), "zero addr");
     }
 
