@@ -299,6 +299,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         address pool = getPancakeV3Pool(params.tokenIn, params.tokenOut, params.fee);
         require(pairWL[_treasury][pool], "pool wl err");
         address _bot = createOrGetBot(_treasury, botId);
+        require(_bot == params.recipient, "rec err");
         IERC20(params.tokenIn).safeTransferFrom(_treasury, _bot, params.amountIn);
         _internalSwapV3(_bot, params);
         checkPriceLimit(false, _treasury, pool);
