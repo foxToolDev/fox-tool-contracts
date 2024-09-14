@@ -12,11 +12,11 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-interface IPancakeFactory {
+interface IUniswapV2Factory {
     function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
 
-interface IPancakeRouter01 {
+interface IUniswapV2Router01 {
     function factory() external pure returns (address);
 
     function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
@@ -40,7 +40,7 @@ interface IPancakeRouter01 {
         returns (uint256[] memory amounts);
 }
 
-interface IPancakePair {
+interface IUniswapV2Pair {
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
@@ -62,11 +62,11 @@ interface ISwapRouter {
     function factory() external view returns (address);
 }
 
-interface IPancakeV3Factory {
+interface IUniswapV3Factory {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
 }
 
-interface IPancakeV3Pool {
+interface IUniswapV3Pool {
     function slot0()
         external
         view
@@ -94,7 +94,7 @@ contract ExecutorBot {
     }
 }
 
-contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
+contract Trade is Ownable, Multicall, EIP712, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     bytes32 public constant _TYPEHASH = keccak256("ParamsHash(uint8 actionType,bytes32 hash)");
@@ -136,7 +136,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
     constructor(address _router, address _routerv3) Ownable(msg.sender) EIP712("foxtool", "1") {
         router = _router;
         routerv3 = _routerv3;
-        factory = IPancakeRouter01(_router).factory();
+        factory = IUniswapV2Router01(_router).factory();
         factory3 = ISwapRouter(_routerv3).factory();
         executorBotImpl = address(new ExecutorBot(address(this)));
     }
@@ -163,7 +163,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         )
         nonReentrant
     {
-        address pair = IPancakeFactory(factory).getPair(path[0], path[1]);
+        address pair = IUniswapV2Factory(factory).getPair(path[0], path[1]);
         require(pairWL[_treasury][pair], "pair wl err");
         IERC20(path[0]).safeTransferFrom(_treasury, pair, amountIn);
         address _bot = getBotAddr(_treasury, botId);
@@ -194,7 +194,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         )
         nonReentrant
     {
-        address pair = IPancakeFactory(factory).getPair(path[0], path[1]);
+        address pair = IUniswapV2Factory(factory).getPair(path[0], path[1]);
         require(pairWL[_treasury][pair], "pair wl err");
         uint256 _amountIn = 0;
         for (uint256 i = 0; i < amountIns.length; i++) {
@@ -221,7 +221,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         } else {
             out = _swap(_amountIn, path, to, pair);
         }
-        require(out >= amountOutMin, "PancakeRouter: INSUFFICIENT_OUTPUT_AMOUNT");
+        require(out >= amountOutMin, "Router: INSUFFICIENT_OUTPUT_AMOUNT");
     }
 
     // **** SWAP ****
@@ -230,12 +230,12 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         private
         returns (uint256 amountOut)
     {
-        uint256[] memory amounts = IPancakeRouter01(router).getAmountsOut(_amountIn, path);
+        uint256[] memory amounts = IUniswapV2Router01(router).getAmountsOut(_amountIn, path);
         (address input, address output) = (path[0], path[1]);
         (address token0,) = sortTokens(input, output);
         amountOut = amounts[1];
         (uint256 amount0Out, uint256 amount1Out) = input == token0 ? (uint256(0), amountOut) : (amountOut, uint256(0));
-        IPancakePair(pair).swap(amount0Out, amount1Out, to, new bytes(0));
+        IUniswapV2Pair(pair).swap(amount0Out, amount1Out, to, new bytes(0));
     }
 
     // **** SWAP (supporting fee-on-transfer tokens) ****
@@ -247,7 +247,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         uint256 balanceBefore = IERC20(path[1]).balanceOf(to);
         (address input, address output) = (path[0], path[1]);
         (address token0,) = sortTokens(input, output);
-        IPancakePair pair = IPancakePair(_pair);
+        IUniswapV2Pair pair = IUniswapV2Pair(_pair);
         uint256 amountInput;
         uint256 amountOutput;
         {
@@ -256,7 +256,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
             (uint256 reserveInput, uint256 reserveOutput) =
                 input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
             amountInput = IERC20(input).balanceOf(address(pair)) - reserveInput;
-            amountOutput = IPancakeRouter01(router).getAmountOut(amountInput, reserveInput, reserveOutput);
+            amountOutput = IUniswapV2Router01(router).getAmountOut(amountInput, reserveInput, reserveOutput);
         }
         (uint256 amount0Out, uint256 amount1Out) =
             input == token0 ? (uint256(0), amountOutput) : (amountOutput, uint256(0));
@@ -296,7 +296,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         )
         nonReentrant
     {
-        address pool = getPancakeV3Pool(params.tokenIn, params.tokenOut, params.fee);
+        address pool = getV3Pool(params.tokenIn, params.tokenOut, params.fee);
         require(pairWL[_treasury][pool], "pool wl err");
         address _bot = createOrGetBot(_treasury, botId);
         require(_bot == params.recipient, "rec err");
@@ -338,7 +338,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         )
         nonReentrant
     {
-        address pool = getPancakeV3Pool(params.tokenIn, params.tokenOut, params.fee);
+        address pool = getV3Pool(params.tokenIn, params.tokenOut, params.fee);
         require(pairWL[_treasury][pool], "pool wl err");
         address senderBot = createOrGetBot(_treasury, botIds[0]);
         uint256 amountIn = amountIns[0];
@@ -359,8 +359,8 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
         ExecutorBot(senderBot).execute(routerv3, data, 0);
     }
 
-    function getPancakeV3Pool(address tokenA, address tokenB, uint24 fee) public view returns (address pool) {
-        return IPancakeV3Factory(factory3).getPool(tokenA, tokenB, fee);
+    function getV3Pool(address tokenA, address tokenB, uint24 fee) public view returns (address pool) {
+        return IUniswapV3Factory(factory3).getPool(tokenA, tokenB, fee);
     }
 
     modifier checkMakerDeadline(
@@ -410,10 +410,10 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
             return;
         }
         if (isV2) {
-            (uint112 reserve0, uint112 reserve1,) = IPancakePair(pair).getReserves();
+            (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
             curPrice = 1e18 * uint256(reserve0) / uint256(reserve1);
         } else {
-            (uint160 sqrtPriceX96,,,,,,) = IPancakeV3Pool(pair).slot0();
+            (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pair).slot0();
             curPrice = uint256(sqrtPriceX96);
         }
         if (min > 0) {
@@ -460,11 +460,11 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
     }
 
     function getAmountsOut(uint256 amountIn, address[] memory path) public view returns (uint256[] memory amounts) {
-        amounts = IPancakeRouter01(router).getAmountsOut(amountIn, path);
+        amounts = IUniswapV2Router01(router).getAmountsOut(amountIn, path);
     }
 
     function getAmountsIn(uint256 amountOut, address[] memory path) public view returns (uint256[] memory amounts) {
-        amounts = IPancakeRouter01(router).getAmountsIn(amountOut, path);
+        amounts = IUniswapV2Router01(router).getAmountsIn(amountOut, path);
     }
 
     receive() external payable {
@@ -509,7 +509,7 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
     }
 
     function getPair(address token0, address token1) public view returns (address pair) {
-        pair = IPancakeFactory(factory).getPair(token0, token1);
+        pair = IUniswapV2Factory(factory).getPair(token0, token1);
     }
 
     function isContract(address account) public view returns (bool) {
@@ -575,9 +575,9 @@ contract PancakeTrade is Ownable, Multicall, EIP712, ReentrancyGuard {
     }
 
     function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
-        require(tokenA != tokenB, "PancakeLibrary: IDENTICAL_ADDRESSES");
+        require(tokenA != tokenB, "Library: IDENTICAL_ADDRESSES");
         (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
-        require(token0 != address(0), "PancakeLibrary: ZERO_ADDRESS");
+        require(token0 != address(0), "Library: ZERO_ADDRESS");
     }
 
     //manager

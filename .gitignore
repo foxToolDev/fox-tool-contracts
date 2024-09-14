@@ -12,4 +12,4 @@ docs/
 
 # Dotenv file
 .env
-broadcast/PancakeTradePro.s.sol/56/*
+broadcast/*
